@@ -841,6 +841,7 @@ extern "C" {
         ENetPeer *            peers;        /**< array of peers allocated for this host */
         size_t                peerCount;    /**< number of peers allocated for this host */
         size_t                channelLimit; /**< maximum number of channels allowed for connected peers */
+        enet_uint16           minimumRoundTripMargin; /**< the minimum amount of time a packet will wait before trying to retransmit in milliseconds > */ 
         enet_uint32           serviceTime;
         ENetList              dispatchQueue;
         enet_uint32           totalQueued;
@@ -1078,6 +1079,7 @@ extern "C" {
     ENET_API int        enet_host_send_raw_ex(ENetHost *host, const ENetAddress* address, enet_uint8* data, size_t skipBytes, size_t bytesToSend);
     ENET_API void       enet_host_set_intercept(ENetHost *, const ENetInterceptCallback);
     ENET_API void       enet_host_set_handle_connect(ENetHost *, const ENetHandleConnectCallback);
+    ENET_API void       enet_host_set_minimum_rto_margin(ENetHost *, const enet_uint16);
     ENET_API void       enet_host_flush(ENetHost *);
     ENET_API void       enet_host_broadcast(ENetHost *, enet_uint8, ENetPacket *);
     ENET_API void       enet_host_compress(ENetHost *, const ENetCompressor *);
@@ -2997,7 +2999,7 @@ extern "C" {
 
             /* Replaced exponential backoff time with something more linear */
             /* Source: http://lists.cubik.org/pipermail/enet-discuss/2014-May/002308.html */
-            outgoingCommand->roundTripTimeout = peer->roundTripTime + 4 * peer->roundTripTimeVariance;
+            outgoingCommand->roundTripTimeout = peer->roundTripTime + ENET_MAX(4 * peer->roundTripTimeVariance, host->minimumRoundTripMargin);
 
             if (outgoingCommand->packet != NULL) {
                 peer->reliableDataInTransit -= outgoingCommand->fragmentLength;
@@ -3098,7 +3100,7 @@ extern "C" {
                 ++outgoingCommand->sendAttempts;
 
                 if (outgoingCommand->roundTripTimeout == 0) {
-                    outgoingCommand->roundTripTimeout = peer->roundTripTime + 4 * peer->roundTripTimeVariance;
+                    outgoingCommand->roundTripTimeout = peer->roundTripTime + ENET_MAX(4 * peer->roundTripTimeVariance, host->minimumRoundTripMargin);
                 }
 
                 if (enet_list_empty(&peer->sentReliableCommands)) {
@@ -4661,6 +4663,7 @@ extern "C" {
         host->channelLimit                  = channelLimit;
         host->incomingBandwidth             = incomingBandwidth;
         host->outgoingBandwidth             = outgoingBandwidth;
+        host->minimumRoundTripMargin        = 4;
         host->bandwidthThrottleEpoch        = 0;
         host->recalculateBandwidthLimits    = 0;
         host->mtu                           = ENET_HOST_DEFAULT_MTU;
@@ -4915,6 +4918,15 @@ extern "C" {
      */
     void enet_host_set_handle_connect(ENetHost *host, const ENetHandleConnectCallback callback) {
         host->handle_connect = callback;
+    }
+
+    /** Sets the minimum amount of time a packet will wait before being considered
+    * not received and retransmitting
+    * @param host the host to set the minimum rto margin on
+    * @param minimumRoundTripMargin the minimum amount of time to wait before retransmitting.
+    */
+    void enet_host_set_minimum_rto_margin(ENetHost *host, const enet_uint16 minimumRoundTripMargin) {
+        host->minimumRoundTripMargin = minimumRoundTripMargin;
     }
 
     /** Sets the packet compressor the host should use to compress and decompress packets.
