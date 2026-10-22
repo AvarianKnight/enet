@@ -644,6 +644,7 @@ extern "C" {
         ENET_HOST_DEFAULT_MAXIMUM_RECEIVE_TIME = 10,
 
         ENET_PEER_DEFAULT_ROUND_TRIP_TIME      = 500,
+        ENET_PEER_MIMIMUM_RTO_MARGIN           = 4,
         ENET_PEER_DEFAULT_PACKET_THROTTLE      = 32,
         ENET_PEER_PACKET_THROTTLE_SCALE        = 32,
         ENET_PEER_PACKET_THROTTLE_COUNTER      = 7,
@@ -2997,7 +2998,7 @@ extern "C" {
 
             /* Replaced exponential backoff time with something more linear */
             /* Source: http://lists.cubik.org/pipermail/enet-discuss/2014-May/002308.html */
-            outgoingCommand->roundTripTimeout = peer->roundTripTime + 4 * peer->roundTripTimeVariance;
+            outgoingCommand->roundTripTimeout = peer->roundTripTime + ENET_MAX(4 * peer->roundTripTimeVariance, ENET_PEER_MINIMUM_RTO_MARGIN);
 
             if (outgoingCommand->packet != NULL) {
                 peer->reliableDataInTransit -= outgoingCommand->fragmentLength;
@@ -3098,7 +3099,7 @@ extern "C" {
                 ++outgoingCommand->sendAttempts;
 
                 if (outgoingCommand->roundTripTimeout == 0) {
-                    outgoingCommand->roundTripTimeout = peer->roundTripTime + 4 * peer->roundTripTimeVariance;
+                    outgoingCommand->roundTripTimeout = peer->roundTripTime + ENET_MAX(4 * peer->roundTripTimeVariance, ENET_PEER_MINIMUM_RTO_MARGIN);
                 }
 
                 if (enet_list_empty(&peer->sentReliableCommands)) {
