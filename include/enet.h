@@ -142,6 +142,9 @@
     #define ENET_SOCKETSET_REMOVE(sockset, socket) FD_CLR(socket, &(sockset))
     #define ENET_SOCKETSET_CHECK(sockset, socket)  FD_ISSET(socket, &(sockset))
 #else
+    #ifndef _GNU_SOURCE
+    #define _GNU_SOURCE
+    #endif
     #include <sys/types.h>
     #include <sys/ioctl.h>
     #include <sys/time.h>
@@ -203,6 +206,10 @@
 #else
 #pragma message("WARNING: Please ENET_DEPRECATED for this compiler")
 #define ENET_DEPRECATED(func) func
+#endif
+
+#ifndef ENET_SOCKET_MAX_BUFFER
+#define ENET_SOCKET_MAX_BUFFER 256
 #endif
 
 #ifndef ENET_BUFFER_MAXIMUM
@@ -303,7 +310,7 @@ extern "C" {
 
     enum {
         ENET_PROTOCOL_MINIMUM_MTU             = 576,
-        ENET_PROTOCOL_MAXIMUM_MTU             = 4096,
+        ENET_PROTOCOL_MAXIMUM_MTU             = 1440,
         ENET_PROTOCOL_MAXIMUM_PACKET_COMMANDS = 32,
         ENET_PROTOCOL_MINIMUM_WINDOW_SIZE     = 4096,
         ENET_PROTOCOL_MAXIMUM_WINDOW_SIZE     = 65536,
@@ -814,6 +821,15 @@ extern "C" {
     /** Callback for destroying fragment tracking arrays. */
     typedef void (ENET_CALLBACK *ENetFragmentsDestroyCallback)(ENetPeer *peer, enet_uint32* fragments, uint32_t fragmentCount);
 
+    /** ENet buffers for handling receiving multiple UDP datagrams in a single syscall
+    *
+    */
+    typedef struct _ENetReceiveBuffer {
+        ENetAddress receiver;
+        uint8_t buffer[ENET_PROTOCOL_MAXIMUM_MTU];
+        uint16_t bufferLength;
+    } ENetReceiveBuffer;
+
     /** An ENet host for communicating with peers.
      *
      * No fields should be modified unless otherwise stated.
@@ -850,18 +866,17 @@ extern "C" {
         size_t                commandCount;
         ENetBuffer            buffers[ENET_BUFFER_MAXIMUM];
         size_t                bufferCount;
-        ENetChecksumCallback  checksum; /**< callback the user can set to enable packet checksums for this host */
-        ENetCompressor        compressor;
         enet_uint8            packetData[2][ENET_PROTOCOL_MAXIMUM_MTU];
         ENetAddress           receivedAddress;
         enet_uint8 *          receivedData;
         size_t                receivedDataLength;
+        size_t                receiveSocketSize;
+        size_t                receiveSocketLastIndex;
+        ENetReceiveBuffer*    receiveSocketBuffer;
         enet_uint32           totalSentData;        /**< total data sent, user should reset to 0 as needed to prevent overflow */
         enet_uint32           totalSentPackets;     /**< total UDP packets sent, user should reset to 0 as needed to prevent overflow */
         enet_uint32           totalReceivedData;    /**< total data received, user should reset to 0 as needed to prevent overflow */
         enet_uint32           totalReceivedPackets; /**< total UDP packets received, user should reset to 0 as needed to prevent overflow */
-        ENetInterceptCallback intercept;            /**< callback the user can set to intercept received raw UDP packets */
-        ENetHandleConnectCallback handle_connect;
         size_t                connectedPeers;
         size_t                bandwidthLimitedPeers;
         size_t                peerScanLimit;      /**< upper bound peer index */
@@ -870,6 +885,10 @@ extern "C" {
         size_t                maximumWaitingData; /**< the maximum aggregate amount of buffer space a peer may use waiting for packets to be delivered */
         enet_uint32           maximumReceiveTime;  /**< the maximum time the host consumes to receive packets */
         void *                data;               /**< Application private data, may be freely modified */
+        ENetChecksumCallback  checksum; /**< callback the user can set to enable packet checksums for this host */
+        ENetCompressor        compressor;
+        ENetInterceptCallback intercept;            /**< callback the user can set to intercept received raw UDP packets */
+        ENetHandleConnectCallback handle_connect;
         ENetPacketCreateCallback packet_create;
         ENetPacketDestroyCallback packet_destroy;
         ENetChannelsCreateCallback channels_create;
@@ -976,6 +995,7 @@ extern "C" {
     ENET_API int        enet_socket_connect(ENetSocket, const ENetAddress *);
     ENET_API int        enet_socket_send(ENetSocket, const ENetAddress *, const ENetBuffer *, size_t);
     ENET_API int        enet_socket_receive(ENetSocket, ENetAddress *, ENetBuffer *, size_t);
+    ENET_API int        enet_socket_receive_batch(ENetSocket, ENetReceiveBuffer*);
     ENET_API int        enet_socket_wait(ENetSocket, enet_uint32 *, enet_uint64);
     ENET_API int        enet_socket_set_option(ENetSocket, ENetSocketOption, int);
     ENET_API int        enet_socket_get_option(ENetSocket, ENetSocketOption, int *);
@@ -2850,57 +2870,53 @@ extern "C" {
     } /* enet_protocol_handle_incoming_commands */
 
     static int enet_protocol_receive_incoming_commands(ENetHost *host, ENetEvent *event) {
-        int packets;
         enet_uint32 end_time = enet_time_get() + host->maximumReceiveTime;
 
         do {
-            for (packets = 0; packets < 256; ++packets) {
-                int receivedLength;
-                ENetBuffer buffer;
-
-                buffer.data       = host->packetData[0];
-                // buffer.dataLength = sizeof (host->packetData[0]);
-                buffer.dataLength = host->mtu;
-
-                receivedLength    = enet_socket_receive(host->socket, &host->receivedAddress, &buffer, 1);
-
-                if (receivedLength == -2)
-                    continue;
-
-                if (receivedLength < 0) {
-                    return -1;
-                }
-
-                if (receivedLength == 0) {
+            // whenever we've finished processing our last buffer then we should
+            // fetch more packets
+            if (host->receiveSocketSize == 0 || host->receiveSocketSize <= host->receiveSocketLastIndex) {
+                int receivedLength = enet_socket_receive_batch(host->socket, host->receiveSocketBuffer);
+                if (receivedLength == 0)
+                {
+                    host->receiveSocketSize = 0;
                     return 0;
                 }
 
-                host->receivedData       = host->packetData[0];
-                host->receivedDataLength = receivedLength;
-
-                host->totalReceivedData += receivedLength;
-                host->totalReceivedPackets++;
-
-                if (host->intercept != NULL) {
-                    switch (host->intercept(host, (void *)event)) {
-                        case 1:
-                            if (event != NULL && event->type != ENET_EVENT_TYPE_NONE) {
-                                return 1;
-                            }
-
-                            continue;
-
-                        case -1:
-                            return -1;
-
-                        default:
-                            break;
-                    }
+                if (receivedLength < 0) {
+                    host->receiveSocketSize = 0;
+                    return -1;
                 }
 
-                switch (enet_protocol_handle_incoming_commands(host, event)) {
+                host->receiveSocketSize = receivedLength;
+                host->receiveSocketLastIndex = 0;
+
+                continue;
+            }
+
+            ENetReceiveBuffer* buff = &host->receiveSocketBuffer[host->receiveSocketLastIndex++];
+
+            // only time the buffer length will be 0 is whenever we've gotten a
+            // truncated packet, so skip these.
+            if (buff->bufferLength == 0) {
+                continue;
+            }
+
+            host->receivedData       = buff->buffer;
+            host->receivedDataLength = buff->bufferLength;
+            host->receivedAddress    = buff->receiver;
+
+            host->totalReceivedData += buff->bufferLength;
+            host->totalReceivedPackets++;
+
+            if (host->intercept != NULL) {
+                switch (host->intercept(host, (void *)event)) {
                     case 1:
-                        return 1;
+                        if (event != NULL && event->type != ENET_EVENT_TYPE_NONE) {
+                            return 1;
+                        }
+
+                        continue;
 
                     case -1:
                         return -1;
@@ -2909,9 +2925,20 @@ extern "C" {
                         break;
                 }
             }
+
+            switch (enet_protocol_handle_incoming_commands(host, event)) {
+                case 1:
+                    return 1;
+
+                case -1:
+                    return -1;
+
+                default:
+                    break;
+            }
         } while (enet_time_get() < end_time);
 
-        return -1;
+        return 0;
     } /* enet_protocol_receive_incoming_commands */
 
     static void enet_protocol_send_acknowledgements(ENetHost *host, ENetPeer *peer) {
@@ -4625,6 +4652,14 @@ extern "C" {
 
         memset(host->peers, 0, peerCount * sizeof(ENetPeer));
 
+        host->receiveSocketBuffer = (ENetReceiveBuffer*) enet_malloc(ENET_SOCKET_MAX_BUFFER * sizeof(ENetReceiveBuffer));
+        if (host->receiveSocketBuffer == NULL) {
+            enet_free(host->peers);
+            enet_free(host);
+            return NULL;
+        }
+        memset(host->receiveSocketBuffer, 0, ENET_SOCKET_MAX_BUFFER * sizeof(ENetReceiveBuffer));
+
         host->socket = enet_socket_create(ENET_SOCKET_TYPE_DATAGRAM);
         if (host->socket != ENET_SOCKET_NULL) {
             enet_socket_set_option (host->socket, ENET_SOCKOPT_IPV6_V6ONLY, 0);
@@ -4635,6 +4670,7 @@ extern "C" {
                 enet_socket_destroy(host->socket);
             }
 
+            enet_free(host->receiveSocketBuffer);
             enet_free(host->peers);
             enet_free(host);
 
@@ -4742,6 +4778,7 @@ extern "C" {
             (*host->compressor.destroy)(host->compressor.context);
         }
 
+        enet_free(host->receiveSocketBuffer);
         enet_free(host->peers);
         enet_free(host);
     }
@@ -5865,6 +5902,64 @@ extern "C" {
         return sentLength;
     } /* enet_socket_send */
 
+    int enet_socket_receive_batch(ENetSocket socket, ENetReceiveBuffer* buffers) {
+        struct mmsghdr      msgs[ENET_SOCKET_MAX_BUFFER];
+        struct iovec        iovecs[ENET_SOCKET_MAX_BUFFER];
+        struct sockaddr_in6 sids[ENET_SOCKET_MAX_BUFFER];
+
+        memset(msgs, 0, sizeof(msgs));
+
+        for (int i = 0; i < ENET_SOCKET_MAX_BUFFER; ++i) {
+            iovecs[i].iov_base         = &buffers[i].buffer;
+            iovecs[i].iov_len          = ENET_PROTOCOL_MAXIMUM_MTU;
+
+            struct msghdr* msgHdr = &msgs[i].msg_hdr;
+
+            msgHdr->msg_name = &sids[i];
+            msgHdr->msg_namelen = sizeof(struct sockaddr_in6);
+
+            msgHdr->msg_iovlen = 1;
+            msgHdr->msg_iov = &iovecs[i];
+        }
+
+        int recvLength = recvmmsg(socket, msgs, ENET_SOCKET_MAX_BUFFER, MSG_NOSIGNAL, NULL);
+
+
+        if (recvLength == -1) {
+            if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                return 0;
+            }
+
+            return -1;
+        }
+
+        for (int i = 0; i < recvLength; ++i) {
+            struct mmsghdr msg = msgs[i];
+
+            ENetReceiveBuffer* buf = &buffers[i];
+
+            // on truncate treat the buffer as empty as we don't want to do a
+            // partial message
+            if (msg.msg_hdr.msg_flags & MSG_TRUNC) {
+                buf->bufferLength = 0;
+                continue;
+            }
+
+            struct sockaddr_in6 sin = sids[i];
+
+            ENetAddress addr;
+            addr.host           = sin.sin6_addr;
+            addr.port           = ENET_NET_TO_HOST_16(sin.sin6_port);
+            addr.sin6_scope_id  = sin.sin6_scope_id;
+
+            buf->bufferLength = msg.msg_len;
+            buf->receiver = addr;
+        }
+
+
+        return recvLength;
+    } /* enet_socket_receive_batch */
+
     int enet_socket_receive(ENetSocket socket, ENetAddress *address, ENetBuffer *buffers, size_t bufferCount) {
         struct msghdr msgHdr;
         struct sockaddr_in6 sin;
@@ -6247,6 +6342,55 @@ extern "C" {
 
         return (int) sentLength;
     }
+
+    int enet_socket_receive_batch(ENetSocket socket, ENetReceiveBuffer* buffers) {
+        for (int i = 0; i < ENET_SOCKET_MAX_BUFFER; ++i) {
+            ENetReceiveBuffer* buff = &buffers[i];
+
+            WSABUF wsaBuf = { ENET_PROTOCOL_MAXIMUM_MTU, (CHAR *) buff->buffer };
+
+            INT sinLength = sizeof(struct sockaddr_in6);
+            DWORD flags   = 0, recvLength = 0;
+            struct sockaddr_in6 sin = {0};
+
+            if (WSARecvFrom(socket,
+                (LPWSABUF) &wsaBuf,
+                (DWORD) 1,
+                &recvLength,
+                &flags,
+                (struct sockaddr *) &sin,
+                &sinLength,
+                NULL,
+                NULL) == SOCKET_ERROR
+            ) {
+                switch (WSAGetLastError()) {
+                    case WSAECONNRESET:
+                    case WSAEINTR:
+                    case WSAEMSGSIZE:
+                        buff->bufferLength = 0;
+                        continue;
+                    case WSAEWOULDBLOCK:
+                    default:
+                        return i;
+                }
+            }
+
+            if (flags & MSG_PARTIAL) {
+                buff->bufferLength = 0;
+                continue;
+            }
+            buff->bufferLength = (enet_uint16) recvLength;
+
+            ENetAddress address;
+            address.host           = sin.sin6_addr;
+            address.port           = ENET_NET_TO_HOST_16(sin.sin6_port);
+            address.sin6_scope_id  = sin.sin6_scope_id;
+            buff->receiver = address;
+        }
+
+        return ENET_SOCKET_MAX_BUFFER;
+    } /* enet_socket_receive_batch */
+
 
     int enet_socket_receive(ENetSocket socket, ENetAddress *address, ENetBuffer *buffers, size_t bufferCount) {
         INT sinLength = sizeof(struct sockaddr_in6);

@@ -13,6 +13,10 @@ if (ENET_USE_MORE_PEERS)
     add_definitions(-DENET_USE_MORE_PEERS)
 endif()
 
+if (NOT WIN32)
+  add_compile_definitions(_GNU_SOURCE)
+endif()
+
 # -----------------------------
 # 2) Static library
 # -----------------------------
